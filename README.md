@@ -1,3 +1,5 @@
+![Banner](banner.png)
+
 # ivs-SuspiciousProcessMonitor
 A command-line tool that monitors running processes on a host and flags processes with unusual characteristics, such as unsigned binaries, unusual network connections, or high CPU usage. Uses `psutil` library. - Focused on Simple vulnerability scanner focusing on common misconfigurations in web infrastructure. Checks for exposed `.env` files, common admin panels, and outdated software versions by crawling a target website and analyzing responses.
 
