@@ -1,6 +1,7 @@
 import argparse
 import logging
 import os
+import re
 import sys
 import requests
 from bs4 import BeautifulSoup
@@ -49,19 +50,23 @@ def check_env_files(url):
         list: A list of URLs where .env files were found.
     """
     env_paths = [".env", ".env.example", "config/.env", "application/.env"]
+    # Common markers from several stacks, plus a KEY=value line shape.
+    env_markers = ["APP_KEY", "DB_HOST", "DB_PASSWORD", "DB_DATABASE",
+                   "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY",
+                   "SECRET_KEY", "DATABASE_URL", "MAIL_PASSWORD"]
+    env_line = re.compile(r"^[A-Z][A-Z0-9_]{2,}\s*=\s*\S+", re.MULTILINE)
     found_env_files = []
     for path in env_paths:
         env_url = urljoin(url, path)
         try:
             response = requests.get(env_url, timeout=5)
-            response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
-            if "APP_KEY" in response.text:  # Simple heuristic to identify valid .env
+            if response.status_code != 200:
+                continue
+            if any(m in response.text for m in env_markers) or env_line.search(response.text):
                 logging.warning(f"Potential .env file found at: {env_url}")
                 found_env_files.append(env_url)
             else:
                 logging.debug(f"Checked {env_url}, but it doesn't seem to be a valid .env file.")
-
-
         except requests.exceptions.RequestException as e:
             logging.debug(f"Error checking {env_url}: {e}")
 
@@ -78,15 +83,24 @@ def check_admin_panels(url):
         list: A list of URLs where admin panels were found.
     """
     admin_paths = ["admin", "administrator", "login", "wp-admin", "panel"]
+    admin_markers = ["login", "log in", "sign in", "username", "password",
+                     "admin", "dashboard", "wp-login"]
     found_admin_panels = []
     for path in admin_paths:
         admin_url = urljoin(url, path)
         try:
+            # No raise_for_status: a 403 is itself a meaningful answer here.
             response = requests.get(admin_url, timeout=5)
-            response.raise_for_status() # Raise HTTPError for bad responses
-            if response.status_code == 200 or response.status_code == 403: # Check for valid status codes
+            if response.status_code == 403:
                 logging.warning(f"Potential admin panel found at: {admin_url}")
                 found_admin_panels.append(admin_url)
+            elif response.status_code == 200:
+                body = response.text.lower()
+                # A bare 200 is not enough: catch-all sites answer 200 for
+                # every path. Require a login or admin marker in the body.
+                if any(marker in body for marker in admin_markers):
+                    logging.warning(f"Potential admin panel found at: {admin_url}")
+                    found_admin_panels.append(admin_url)
         except requests.exceptions.RequestException as e:
             logging.debug(f"Error checking {admin_url}: {e}")
     return found_admin_panels
@@ -160,12 +174,14 @@ def crawl_website(url, depth=3):
         if current_url in visited or current_depth > depth:
             continue
 
-        visited.add(current_url)
         logging.info(f"Crawling: {current_url} (Depth: {current_depth})")
 
         try:
             response = requests.get(current_url, timeout=5)
             response.raise_for_status()
+            # Count a URL only after a fetch actually succeeded, so a dead
+            # target is not reported as one found URL.
+            visited.add(current_url)
             soup = BeautifulSoup(response.text, 'html.parser')
 
             for link in soup.find_all('a', href=True):
@@ -196,54 +212,71 @@ def main():
 
     logging.info(f"Starting scan on: {target_url}")
 
+    # Build the report in memory. It is written to the output file only
+    # after the scan completes, so a failed scan never truncates or
+    # replaces a pre-existing output file.
+    lines = []
     try:
-
-        if output_file:
-            # Redirect output to file
-            sys.stdout = open(output_file, "w")
-
-        print(f"Scanning {target_url}...")
-
-        # Crawl the website
-        print("\nCrawling website...")
+        lines.append(f"Scanning {target_url}...")
+        lines.append("\nCrawling website...")
         discovered_urls = crawl_website(target_url, crawl_depth)
-        print(f"Found {len(discovered_urls)} URLs during crawling.")
+        if not discovered_urls:
+            logging.error("Scan failed: no page could be fetched from the target.")
+            print("Scan failed: no page could be fetched from the target.")
+            sys.exit(1)
+        lines.append(f"Found {len(discovered_urls)} URLs during crawling.")
 
-        # Check for .env files
-        print("\nChecking for .env files...")
+        lines.append("\nChecking for .env files...")
         env_files = check_env_files(target_url)
         if env_files:
-            print("Potentially exposed .env files found:")
+            lines.append("Potentially exposed .env files found:")
             for url in env_files:
-                print(f"- {url}")
+                lines.append(f"- {url}")
         else:
-            print("No exposed .env files found.")
+            lines.append("No exposed .env files found.")
 
-        # Check for admin panels
-        print("\nChecking for common admin panels...")
+        lines.append("\nChecking for common admin panels...")
         admin_panels = check_admin_panels(target_url)
         if admin_panels:
-            print("Potential admin panels found:")
+            lines.append("Potential admin panels found:")
             for url in admin_panels:
-                print(f"- {url}")
+                lines.append(f"- {url}")
         else:
-            print("No common admin panels found.")
+            lines.append("No common admin panels found.")
 
-        # Check for installed software versions
-        print("\nIdentifying software versions...")
+        lines.append("\nIdentifying software versions...")
         version_info = get_installed_software_versions(target_url)
-        print("Software Version Information:")
+        lines.append("Software Version Information:")
         for info in version_info:
-            print(f"- {info}")
+            lines.append(f"- {info}")
 
+    except SystemExit:
+        raise
     except Exception as e:
         logging.error(f"An unexpected error occurred: {e}")
-    finally:
-        if output_file:
-            sys.stdout.close()
-            sys.stdout = sys.__stdout__  # Restore stdout
+        print(f"Scan failed: {e}")
+        sys.exit(1)
 
-        logging.info("Scan complete.")
+    report = "\n".join(lines) + "\n"
+    if output_file:
+        tmp_path = os.path.join(os.path.dirname(os.path.abspath(output_file)),
+                                os.path.basename(output_file) + ".tmp")
+        try:
+            with open(tmp_path, "w") as fh:
+                fh.write(report)
+            os.replace(tmp_path, output_file)
+        except OSError as e:
+            logging.error(f"Could not write output file: {e}")
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except OSError:
+                pass
+            sys.exit(1)
+    else:
+        print(report, end="")
+
+    logging.info("Scan complete.")
 
 
 if __name__ == "__main__":
