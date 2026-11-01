@@ -57,11 +57,21 @@ def check_env_files(url):
     env_line = re.compile(r"^[A-Z][A-Z0-9_]{2,}\s*=\s*\S+", re.MULTILINE)
     found_env_files = []
     for path in env_paths:
+        # urljoin treats the target as a directory only when it ends with a
+        # slash. main strips the trailing slash, so a target with a path, such
+        # as a site under /app, has that last segment replaced by these check
+        # paths instead of extended by them. The checks probe the host root
+        # either way, which is where these files are usually exposed.
         env_url = urljoin(url, path)
         try:
             response = requests.get(env_url, timeout=5)
             if response.status_code != 200:
                 continue
+            # A 200 alone proves nothing on a catch-all site, so the body has to
+            # confess: a known key name, or any line shaped like an uppercase
+            # assignment. A documentation page quoting an example env line trips
+            # the second test. These are candidates for a human to open, not
+            # confirmations.
             if any(m in response.text for m in env_markers) or env_line.search(response.text):
                 logging.warning(f"Potential .env file found at: {env_url}")
                 found_env_files.append(env_url)
@@ -91,6 +101,10 @@ def check_admin_panels(url):
         try:
             # No raise_for_status: a 403 is itself a meaningful answer here.
             response = requests.get(admin_url, timeout=5)
+            # Admin detection uses the opposite evidence for its two cases. A 403
+            # counts by itself, on the theory that something exists there worth
+            # forbidding, while a 200 needs a login marker in the body because
+            # catch-all sites answer 200 for every made up path.
             if response.status_code == 403:
                 logging.warning(f"Potential admin panel found at: {admin_url}")
                 found_admin_panels.append(admin_url)
@@ -167,6 +181,11 @@ def crawl_website(url, depth=3):
         set: A set of discovered URLs.
     """
     visited = set()
+    # The queue is a list popped from the front, so the crawl is breadth
+    # first. Links are enqueued without a queued set; a URL linked from
+    # ten pages is queued ten times and filtered by visited when popped.
+    # Nothing normalises the URLs, so the same page under a fragment, a
+    # trailing slash variant, and a query variant counts as three.
     to_visit = [(url, 0)]  # (URL, depth)
 
     while to_visit:
@@ -187,6 +206,9 @@ def crawl_website(url, depth=3):
             for link in soup.find_all('a', href=True):
                 absolute_url = urljoin(current_url, link['href'])
                 # Only crawl links within the same domain
+                # Same domain means the exact netloc string, port included. A link to
+                # a subdomain, or to the same host on another port, is outside the
+                # crawl, and the start URL's netloc is reparsed for every link.
                 if urlparse(absolute_url).netloc == urlparse(url).netloc:
                     to_visit.append((absolute_url, current_depth + 1))
 
